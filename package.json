@@ -2,7 +2,7 @@
 	"name": "app-files",
 	"version": "0.1.1",
 	"private": true,
-	"packageManager": "pnpm@11.23.0",
+	"packageManager": "pnpm@11.24.0",
 	"description": "Browse and preview files in JustFiles.",
 	"type": "module",
 	"license": "MIT",
