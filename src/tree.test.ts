@@ -1,13 +1,9 @@
-import { FileTree, type FileTreeDirectoryHandle, type FileTreeItemHandle } from '@pierre/trees'
+import { FileTree } from '@pierre/trees'
 import { expect, test } from 'vitest'
-import { diffChildren, type TreeEntry, treePath } from './tree.ts'
+import { diffChildren, expandedDirectories, isDirectory, type TreeEntry, treePath } from './tree.ts'
 
 const file = (name: string, ino = name): TreeEntry => ({ ino, name, type: 0 })
 const directory = (name: string, ino = name): TreeEntry => ({ ino, name, type: 1 })
-
-function isDirectory(item: FileTreeItemHandle | null): item is FileTreeDirectoryHandle {
-	return item?.isDirectory() === true
-}
 
 test('treePath keeps directories explicit', () => {
 	expect(treePath('/', directory('notes'))).toBe('notes/')
@@ -58,5 +54,24 @@ test('Pierre fills in ancestors when a deep file is added', () => {
 
 	expect(model.getItem('notes/')).not.toBeNull()
 	expect(model.getItem('notes/trips/')).not.toBeNull()
+	model.cleanUp()
+})
+
+test('expandedDirectories includes flattened ancestors', () => {
+	const model = new FileTree({
+		paths: ['notes/'],
+		flattenEmptyDirectories: true,
+		initialExpansion: 'closed'
+	})
+	const notes = model.getItem('notes/')
+	if (!isDirectory(notes)) throw new Error('notes must be a directory')
+	notes.expand()
+	model.batch([{ type: 'add', path: 'notes/trips/' }])
+
+	expect([...expandedDirectories(model)]).toEqual(['notes/'])
+	const trips = model.getItem('notes/trips/')
+	if (!isDirectory(trips)) throw new Error('trips must be a directory')
+	trips.expand()
+	expect([...expandedDirectories(model)]).toEqual(['notes/', 'notes/trips/'])
 	model.cleanUp()
 })

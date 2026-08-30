@@ -1,9 +1,33 @@
-import type { FileTreeBatchOperation } from '@pierre/trees'
+import type {
+	FileTree,
+	FileTreeBatchOperation,
+	FileTreeDirectoryHandle,
+	FileTreeItemHandle
+} from '@pierre/trees'
 
 export type TreeEntry = {
 	ino: string
 	name: string
 	type: number
+}
+
+export function isDirectory(item: FileTreeItemHandle | null): item is FileTreeDirectoryHandle {
+	return item?.isDirectory() === true
+}
+
+export function expandedDirectories(model: FileTree): Set<string> {
+	const count = model.getVisibleCount()
+	const rows = count === 0 ? [] : model.getVisibleRows(0, count - 1)
+	const expanded = new Set<string>()
+	for (const row of rows) {
+		if (row.kind !== 'directory') continue
+		const paths = row.flattenedSegments?.map((segment) => segment.path) ?? [row.path]
+		for (const path of paths) {
+			const item = model.getItem(path)
+			if (isDirectory(item) && item.isExpanded()) expanded.add(path)
+		}
+	}
+	return expanded
 }
 
 export function treePath(parent: string, entry: TreeEntry): string {

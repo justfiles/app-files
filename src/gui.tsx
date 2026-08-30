@@ -1,11 +1,6 @@
 import type { Client } from '@justfiles/app'
 import { defineGUI } from '@justfiles/app/browser'
-import type {
-	ContextMenuItem,
-	FileTreeBatchOperation,
-	FileTreeDirectoryHandle,
-	FileTreeItemHandle
-} from '@pierre/trees'
+import type { ContextMenuItem, FileTreeBatchOperation } from '@pierre/trees'
 import { FileTree as PierreFileTree, useFileTree } from '@pierre/trees/react'
 import { StrictMode, useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -16,7 +11,7 @@ import {
 	initialState,
 	isUserFacing
 } from './app.ts'
-import { diffChildren, type TreeEntry } from './tree.ts'
+import { diffChildren, expandedDirectories, isDirectory, type TreeEntry } from './tree.ts'
 // Plain side-effect CSS import. `vite dev` injects it; the production build folds
 // it into gui.js as a runtime <style> (see the kernel-host-css plugin in
 // packages/app/vite.ts), so the bundle stays self-contained in every host.
@@ -246,10 +241,6 @@ const stripSlash = (path: string) => path.replace(/^\/+/, '')
 
 type FileTreeModel = ReturnType<typeof useFileTree>['model']
 
-function isDirectory(item: FileTreeItemHandle | null): item is FileTreeDirectoryHandle {
-	return item?.isDirectory() === true
-}
-
 function volumePath(path: string): string {
 	return `/${path}`.replace(/\/+$/, '') || '/'
 }
@@ -444,11 +435,7 @@ function FilesTree(props: {
 	useEffect(
 		() =>
 			model.subscribe(() => {
-				const count = model.getVisibleCount()
-				const rows = count === 0 ? [] : model.getVisibleRows(0, count - 1)
-				const next = new Set(
-					rows.filter((row) => row.kind === 'directory' && row.isExpanded).map((row) => row.path)
-				)
+				const next = expandedDirectories(model)
 				const opened = [...next].filter((path) => !expanded.current.has(path))
 				expanded.current = next
 				const roots = opened.filter(
