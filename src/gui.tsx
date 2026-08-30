@@ -478,10 +478,11 @@ function FilesTree(props: {
 
 	useEffect(() => {
 		void revision
+		// Do not seed the tree from the persisted selection. Pierre fills in missing
+		// ancestors for a deep path, which would make that one path look loaded.
 		const paths = ['/', ...[...expanded.current].map(volumePath)]
-		if (props.selectedPath) paths.push(parentDirectory(props.selectedPath))
 		void load.current(paths)
-	}, [revision, props.selectedPath])
+	}, [revision])
 
 	useEffect(() => {
 		const entries = snapshots.current.get('/')

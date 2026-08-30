@@ -51,3 +51,12 @@ test('Pierre reports expansion for an explicit directory with no loaded children
 	unsubscribe()
 	model.cleanUp()
 })
+
+test('Pierre fills in ancestors when a deep file is added', () => {
+	const model = new FileTree({ paths: [], initialExpansion: 'closed' })
+	model.batch([{ type: 'add', path: 'notes/trips/kyoto.md' }])
+
+	expect(model.getItem('notes/')).not.toBeNull()
+	expect(model.getItem('notes/trips/')).not.toBeNull()
+	model.cleanUp()
+})
