@@ -102,13 +102,7 @@ test('files watches the open file: one fileChanged per write, stops on clear', a
 	expect(await rev()).toBe(1)
 })
 
-// Regression: a kernel with NO GUI (the server, where the agent runs) never
-// kicks a `refresh`, so the file list must converge on the recursive watch
-// alone. The scan is `.coalesce()`d, so `treeChanged` can always emit it and the
-// runtime single-flights — there is no persisted "loading" flag to strand the
-// app in a permanent "Loading…" (the old bug: a `treeChanged` before any scan
-// latched a rescan that never ran).
-test('files converges from the recursive watch alone, with no refresh/GUI', async () => {
+test('a structural change invalidates the transient tree without scanning', async () => {
 	const fs = volume(memStore())
 	await fs.writeFile('/a.txt', enc.encode('a'))
 
@@ -119,16 +113,43 @@ test('files converges from the recursive watch alone, with no refresh/GUI', asyn
 	)
 	await until(() => v.live() === 1, 'recursive tree watch established')
 
-	// No dispatch of `refresh` — mimic the server. The initial state carries an
-	// empty file list; nothing has scanned yet.
-	const files = async () => ((await k.state(id)) as { files: Array<{ path: string }> }).files
-	expect(await files()).toEqual([])
-
-	// A structural change fires the recursive watch -> treeChanged -> a scan that
-	// actually runs (before this fix it deadlocked, emitting no scan).
+	const revision = async () => ((await k.state(id)) as { treeRevision: number }).treeRevision
+	expect(await revision()).toBe(0)
 	await fs.writeFile('/b.txt', enc.encode('b'))
-	await until(async () => (await files()).length > 0, 'file list populated from the watch')
-	const paths = (await files()).map((f) => f.path)
-	expect(paths).toContain('/a.txt')
-	expect(paths).toContain('/b.txt')
+	await until(async () => (await revision()) === 1, 'tree invalidated')
+	expect(await k.state(id)).toEqual({
+		currentViewing: null,
+		revision: 0,
+		treeRevision: 1,
+		showHidden: false
+	})
+})
+
+test('listDirectories reads only the requested layers', async () => {
+	const fs = volume(memStore())
+	await fs.mkdir('/notes/trips', { recursive: true })
+	await fs.writeFile('/notes/today.md', enc.encode('today'))
+	await fs.writeFile('/notes/trips/kyoto.md', enc.encode('kyoto'))
+
+	const k = kernel({
+		fs,
+		sandbox,
+		clock: {},
+		capabilities: capabilityRegistry({
+			volume: volumeCapability(fs, { systemAllowlist: ['justfiles.files'] })
+		})
+	})
+	const id = await k.install(
+		appBundleFromMemory({ id: 'justfiles.files', name: 'Files', app: code })
+	)
+	const result = (await k.dispatch(id, {
+		type: 'listDirectories',
+		params: { paths: ['/', '/notes'] }
+	})) as Array<{ path: string; entries: Array<{ name: string }> }>
+
+	expect(result).toHaveLength(2)
+	const rootNames = result[0]?.entries.map((entry) => entry.name) ?? []
+	expect(rootNames).toContain('notes')
+	expect(rootNames).not.toContain('today.md')
+	expect(result[1]?.entries.map((entry) => entry.name).sort()).toEqual(['today.md', 'trips'])
 })

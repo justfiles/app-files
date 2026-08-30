@@ -1,17 +1,37 @@
 import type { Client } from '@justfiles/app'
 import { defineGUI } from '@justfiles/app/browser'
-import type { ContextMenuItem, FileTreeBatchOperation } from '@pierre/trees'
+import type {
+	ContextMenuItem,
+	FileTreeBatchOperation,
+	FileTreeDirectoryHandle,
+	FileTreeItemHandle
+} from '@pierre/trees'
 import { FileTree as PierreFileTree, useFileTree } from '@pierre/trees/react'
-import { StrictMode, useEffect, useMemo, useRef, useState } from 'react'
+import { StrictMode, useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { type FilesApp, type FilesState, initialState, isUserFacing } from './app.ts'
+import {
+	type DirectoryResult,
+	type FilesApp,
+	type FilesState,
+	initialState,
+	isUserFacing
+} from './app.ts'
+import { diffChildren, type TreeEntry } from './tree.ts'
 // Plain side-effect CSS import. `vite dev` injects it; the production build folds
 // it into gui.js as a runtime <style> (see the kernel-host-css plugin in
 // packages/app/vite.ts), so the bundle stays self-contained in every host.
 import './gui.css'
 
-const stateOrInitial = (value: unknown): FilesState =>
-	value && typeof value === 'object' && 'files' in value ? (value as FilesState) : initialState
+const stateOrInitial = (value: unknown): FilesState => {
+	if (!value || typeof value !== 'object') return initialState
+	const state = value as Partial<FilesState>
+	return {
+		currentViewing: typeof state.currentViewing === 'string' ? state.currentViewing : null,
+		revision: typeof state.revision === 'number' ? state.revision : 0,
+		treeRevision: typeof state.treeRevision === 'number' ? state.treeRevision : 0,
+		showHidden: state.showHidden === true
+	}
+}
 
 export const gui = defineGUI<FilesApp>({
 	mount(el, state, ctx) {
@@ -59,18 +79,6 @@ type Preview =
 	| { path: string; kind: 'image'; dataUrl: string | null; truncated: boolean; size: number }
 
 function Files({ state, client }: { state: FilesState; client: Client<FilesApp> }) {
-	// Kick a scan on first mount when we have no file list yet. The recursive watch
-	// only fires on CHANGES, so a first-ever open (or a genuinely empty cache) needs
-	// one initial scan to populate the tree; after that, auto-refresh keeps it live.
-	// Whether a scan is in flight is the kernel's business (the scan is coalesced),
-	// so there is nothing stale to neutralize here — we just ensure the list exists.
-	const refreshed = useRef(false)
-	useEffect(() => {
-		if (refreshed.current) return
-		refreshed.current = true
-		if (state.files.length === 0) void client.refresh({})
-	}, [client, state.files.length])
-
 	// Re-read the file whenever `currentViewing` changes — or when `revision`
 	// bumps, which the app does each time the watched file changes on disk (Part
 	// D), so an external edit refreshes the preview. Content is GUI-only transient
@@ -112,15 +120,7 @@ function Files({ state, client }: { state: FilesState; client: Client<FilesApp> 
 			})
 	}, [client, viewing, revision])
 
-	const files = useMemo(() => {
-		const paths = state.files.map((file) => file.path)
-		// Finder-style whitelist: by default only the user-facing folders are shown;
-		// ⌘⇧. flips `showHidden` to reveal the whole volume. `showHidden` may be
-		// absent on state persisted before this field existed — default to false.
-		return state.showHidden ? paths : paths.filter(isUserFacing)
-	}, [state.files, state.showHidden])
 	const showHidden = state.showHidden ?? false
-	const displayError = state.error ?? readError
 	const showPreview = preview && preview.path === viewing ? preview : null
 
 	// Draggable splitter: the sidebar width lives in GUI-only state. Pointer
@@ -155,21 +155,17 @@ function Files({ state, client }: { state: FilesState; client: Client<FilesApp> 
 					<span className="files-title">Files</span>
 					{showHidden ? <span className="files-mode">All files</span> : null}
 				</header>
-				{state.error ? <p className="files-error">{state.error}</p> : null}
-				{files.length === 0 ? (
-					<p className="files-hint">
-						{showHidden ? 'No files yet' : 'No files yet — ⌘⇧. shows all'}
-					</p>
-				) : (
-					<div className="files-tree-wrap">
-						<FilesTree
-							files={files}
-							selectedPath={viewing}
-							onSelect={(path) => void client.setView({ path })}
-							onDelete={(path) => void client.remove({ path })}
-						/>
-					</div>
-				)}
+				<div className="files-tree-wrap">
+					<FilesTree
+						client={client}
+						revision={state.treeRevision}
+						showHidden={showHidden}
+						selectedPath={viewing}
+						onSelect={(path) => void client.setView({ path })}
+						onClear={() => void client.clear({})}
+						onDelete={(path) => void client.remove({ path })}
+					/>
+				</div>
 			</aside>
 			<button
 				type="button"
@@ -209,8 +205,8 @@ function Files({ state, client }: { state: FilesState; client: Client<FilesApp> 
 							</div>
 						</header>
 						<pre className="files-preview">
-							{displayError ? (
-								<span style={{ color: 'var(--danger)' }}>{displayError}</span>
+							{readError ? (
+								<span style={{ color: 'var(--danger)' }}>{readError}</span>
 							) : showPreview ? (
 								showPreview.kind === 'image' ? (
 									showPreview.dataUrl ? (
@@ -250,51 +246,29 @@ const stripSlash = (path: string) => path.replace(/^\/+/, '')
 
 type FileTreeModel = ReturnType<typeof useFileTree>['model']
 
-// Canonical ancestor directory paths of a file, shallowest first, each with a
-// trailing slash: `a/b/c.ts` → [`a/`, `a/b/`]. Root-level files have none.
-function ancestorDirs(path: string): string[] {
-	const dirs: string[] = []
-	for (let i = path.indexOf('/'); i !== -1; i = path.indexOf('/', i + 1))
-		dirs.push(path.slice(0, i + 1))
-	return dirs
+function isDirectory(item: FileTreeItemHandle | null): item is FileTreeDirectoryHandle {
+	return item?.isDirectory() === true
 }
 
-// Parent of a canonical directory path (`a/b/` → `a/`; `a/` → ``).
-function parentDir(dir: string): string {
-	const cut = dir.lastIndexOf('/', dir.length - 2)
-	return cut === -1 ? '' : dir.slice(0, cut + 1)
+function volumePath(path: string): string {
+	return `/${path}`.replace(/\/+$/, '') || '/'
 }
 
-// Reconcile the tree from the `prev` file-path set to `next` using the
-// incremental mutation API instead of a whole-tree `resetPaths`. This preserves
-// expansion + selection (a coarse reset re-applies `initialExpansion`, snapping
-// every folder back to the collapsed default)
-// and only rebuilds touched nodes, so it is also cheaper on large trees. The
-// tree derives directories from file paths: `add` recreates missing ancestors,
-// but `remove` leaves an emptied ancestor behind as an explicit row — so prune
-// the shallowest now-stale dir per branch (a recursive remove takes the rest).
-function applyPathDiff(model: FileTreeModel, prev: string[], next: string[]): void {
-	const prevSet = new Set(prev)
-	const nextSet = new Set(next)
-	const added = next.filter((path) => !prevSet.has(path))
-	const removed = prev.filter((path) => !nextSet.has(path))
-	if (added.length === 0 && removed.length === 0) return
+function parentDirectory(path: string): string {
+	const cut = path.lastIndexOf('/')
+	return cut <= 0 ? '/' : path.slice(0, cut)
+}
 
-	// Directories still backed by a file in `next`; any removed-file ancestor
-	// missing from this set is now empty and must go.
-	const neededDirs = new Set<string>()
-	for (const file of next) for (const dir of ancestorDirs(file)) neededDirs.add(dir)
-	const staleDirs = new Set<string>()
-	for (const file of removed)
-		for (const dir of ancestorDirs(file)) if (!neededDirs.has(dir)) staleDirs.add(dir)
-	const removeDirs = [...staleDirs].filter((dir) => !staleDirs.has(parentDir(dir)))
-
-	const ops: FileTreeBatchOperation[] = []
-	for (const dir of removeDirs) ops.push({ type: 'remove', path: dir, recursive: true })
-	for (const file of removed)
-		if (!removeDirs.some((dir) => file.startsWith(dir))) ops.push({ type: 'remove', path: file })
-	for (const file of added) ops.push({ type: 'add', path: file })
-	model.batch(ops)
+function shownEntries(
+	parent: string,
+	entries: readonly TreeEntry[],
+	showHidden: boolean
+): TreeEntry[] {
+	return entries.filter((entry) => {
+		if (entry.type === 2) return false
+		if (parent !== '/' || showHidden) return true
+		return isUserFacing(`/${entry.name}`)
+	})
 }
 
 // The right-click menu reuses the shared `ds-menu` component (design.css, cloned
@@ -320,84 +294,246 @@ function DeleteMenu(props: { label: string; onDelete: () => void }) {
 }
 
 function FilesTree(props: {
-	files: string[]
+	client: Client<FilesApp>
+	revision: number
+	showHidden: boolean
 	selectedPath: string | null
 	onSelect: (path: string) => void
+	onClear: () => void
 	onDelete: (path: string) => void
 }) {
 	const latest = useRef(props)
 	latest.current = props
-	// `props.files` is derived from `state.files`, which `defineGUI` reconciles
-	// against the last push (see `share` in @justfiles/app/browser) — so it keeps its
-	// identity across a push that changed something else, and only changes when the
-	// file set actually did. Memoizing on it is therefore enough: the reconcile
-	// effect below fires on a real add/remove, never on a selection, and expansion
-	// state is left untouched in the common case.
-	const paths = useMemo(() => props.files.map(stripSlash), [props.files])
 	const selectedPath = props.selectedPath ? stripSlash(props.selectedPath) : null
+	const revision = props.revision
+	const modelRef = useRef<FileTreeModel | null>(null)
 
 	const { model } = useFileTree({
-		paths,
+		paths: [],
 		flattenEmptyDirectories: true,
-		// Finder-like: open on the top level only, every folder collapsed until the
-		// user opens it.
 		initialExpansion: 'closed',
-		initialSelectedPaths: selectedPath ? [selectedPath] : [],
 		itemHeight: 24,
 		density: 0.85,
 		onSelectionChange: (selected) => {
-			const { files, onSelect } = latest.current
-			const path = selected.find((candidate) => files.includes(`/${candidate}`))
-			if (path) onSelect(`/${path}`)
+			const path = selected.find(
+				(candidate) => modelRef.current?.getItem(candidate)?.isDirectory() === false
+			)
+			if (path) latest.current.onSelect(volumePath(path))
 		}
 	})
+	modelRef.current = model
 
-	// The model is created (by useFileTree) with the initial `paths`; seed `prev`
-	// to null so the first run is a no-op, then reconcile each later set change
-	// incrementally instead of rebuilding the whole tree.
-	const prevPaths = useRef<string[] | null>(null)
-	useEffect(() => {
-		const prev = prevPaths.current
-		prevPaths.current = paths
-		if (prev) applyPathDiff(model, prev, paths)
-	}, [model, paths])
+	const snapshots = useRef(new Map<string, TreeEntry[]>())
+	const shown = useRef(new Map<string, TreeEntry[]>())
+	const expanded = useRef(new Set<string>())
+	const tokens = useRef(new Map<string, number>())
+	const alive = useRef(true)
+	const load = useRef<(paths: string[]) => Promise<void>>(async () => {})
+	const [ready, setReady] = useState(false)
+	const [rootCount, setRootCount] = useState(0)
+	const [treeError, setTreeError] = useState<string | null>(null)
 
-	useEffect(() => {
-		if (!selectedPath) return
-		const item = model.getItem(selectedPath)
-		if (!item) return
+	const selectCurrent = useCallback(() => {
+		const path = latest.current.selectedPath
+		if (!path) return
+		const item = model.getItem(stripSlash(path))
+		if (!item || item.isDirectory()) return
 		const selected = model.getSelectedPaths()
-		if (selected.length !== 1 || selected[0] !== selectedPath) {
-			for (const path of selected) model.getItem(path)?.deselect()
-			item.select()
+		if (selected.length === 1 && selected[0] === item.getPath()) return
+		for (const selectedPath of selected) model.getItem(selectedPath)?.deselect()
+		item.select()
+	}, [model])
+
+	load.current = async (requested) => {
+		const paths = [...new Set(requested)]
+		const requestTokens = new Map<string, number>()
+		for (const path of paths) {
+			const token = (tokens.current.get(path) ?? 0) + 1
+			tokens.current.set(path, token)
+			requestTokens.set(path, token)
 		}
-		model.scrollToPath(selectedPath, { focus: false })
-	}, [model, selectedPath])
+
+		let results: DirectoryResult[]
+		try {
+			results = await latest.current.client.listDirectories({ paths })
+		} catch (error) {
+			if (alive.current) setTreeError(error instanceof Error ? error.message : String(error))
+			return
+		}
+		if (!alive.current) return
+
+		const operations: FileTreeBatchOperation[] = []
+		const removedDirectories: string[] = []
+		const errors: string[] = []
+		results.sort((left, right) => left.path.split('/').length - right.path.split('/').length)
+
+		for (const result of results) {
+			if (tokens.current.get(result.path) !== requestTokens.get(result.path)) continue
+			const directoryPath = result.path === '/' ? '' : `${stripSlash(result.path)}/`
+			if (removedDirectories.some((path) => directoryPath.startsWith(path))) continue
+
+			if (!('entries' in result)) {
+				errors.push(result.error)
+				if (
+					result.error.includes('ENOENT') &&
+					latest.current.selectedPath &&
+					(latest.current.selectedPath === result.path ||
+						latest.current.selectedPath.startsWith(`${result.path}/`))
+				)
+					latest.current.onClear()
+				if (result.path === '/') setReady(true)
+				continue
+			}
+
+			const entries = result.entries.filter((entry) => entry.type !== 2)
+			const next = shownEntries(result.path, entries, latest.current.showHidden)
+			const changes = diffChildren(result.path, shown.current.get(result.path) ?? [], next)
+			for (const change of changes) {
+				operations.push(change)
+				if (change.type === 'remove' && change.recursive) removedDirectories.push(change.path)
+			}
+			snapshots.current.set(result.path, entries)
+			shown.current.set(result.path, next)
+
+			const selected = latest.current.selectedPath
+			const moved = changes.find(
+				(change) => change.type === 'move' && volumePath(change.from) === selected
+			)
+			if (moved?.type === 'move') latest.current.onSelect(volumePath(moved.to))
+			else if (
+				selected &&
+				changes.some(
+					(change) =>
+						change.type === 'remove' &&
+						change.recursive &&
+						selected.startsWith(`${volumePath(change.path)}/`)
+				)
+			)
+				latest.current.onClear()
+			else if (
+				selected &&
+				parentDirectory(selected) === result.path &&
+				!entries.some((entry) => entry.name === basename(selected))
+			)
+				latest.current.onClear()
+
+			if (result.path === '/') {
+				setRootCount(next.length)
+				setReady(true)
+			}
+		}
+
+		for (const path of removedDirectories) {
+			const directory = volumePath(path)
+			for (const loadedPath of shown.current.keys())
+				if (loadedPath === directory || loadedPath.startsWith(`${directory}/`))
+					shown.current.delete(loadedPath)
+		}
+		if (operations.length > 0) model.batch(operations)
+		selectCurrent()
+		setTreeError(errors[0] ?? null)
+	}
+
+	useEffect(() => {
+		alive.current = true
+		return () => {
+			alive.current = false
+		}
+	}, [])
+
+	useEffect(
+		() =>
+			model.subscribe(() => {
+				const count = model.getVisibleCount()
+				const rows = count === 0 ? [] : model.getVisibleRows(0, count - 1)
+				const next = new Set(
+					rows.filter((row) => row.kind === 'directory' && row.isExpanded).map((row) => row.path)
+				)
+				const opened = [...next].filter((path) => !expanded.current.has(path))
+				expanded.current = next
+				const roots = opened.filter(
+					(path) => !opened.some((parent) => parent !== path && path.startsWith(parent))
+				)
+				if (roots.length === 0) return
+				queueMicrotask(() => {
+					if (!alive.current) return
+					const stillOpen = roots.filter((path) => {
+						const item = model.getItem(path)
+						return isDirectory(item) && item.isExpanded()
+					})
+					const operations: FileTreeBatchOperation[] = []
+					for (const path of stillOpen) {
+						const directory = volumePath(path)
+						operations.push(...diffChildren(directory, shown.current.get(directory) ?? [], []))
+						for (const loadedPath of shown.current.keys())
+							if (loadedPath === directory || loadedPath.startsWith(`${directory}/`))
+								shown.current.delete(loadedPath)
+					}
+					if (operations.length > 0) model.batch(operations)
+					if (stillOpen.length > 0) void load.current(stillOpen.map(volumePath))
+				})
+			}),
+		[model]
+	)
+
+	useEffect(() => {
+		void revision
+		const paths = ['/', ...[...expanded.current].map(volumePath)]
+		if (props.selectedPath) paths.push(parentDirectory(props.selectedPath))
+		void load.current(paths)
+	}, [revision, props.selectedPath])
+
+	useEffect(() => {
+		const entries = snapshots.current.get('/')
+		if (!entries) return
+		const next = shownEntries('/', entries, props.showHidden)
+		const operations = diffChildren('/', shown.current.get('/') ?? [], next)
+		shown.current.set('/', next)
+		for (const operation of operations) {
+			if (operation.type !== 'remove' || !operation.recursive) continue
+			const directory = volumePath(operation.path)
+			for (const path of shown.current.keys())
+				if (path === directory || path.startsWith(`${directory}/`)) shown.current.delete(path)
+		}
+		setRootCount(next.length)
+		if (operations.length > 0) model.batch(operations)
+		selectCurrent()
+	}, [model, props.showHidden, selectCurrent])
+
+	useEffect(() => {
+		selectCurrent()
+		if (selectedPath && model.getItem(selectedPath))
+			model.scrollToPath(selectedPath, { focus: false })
+	}, [model, selectedPath, selectCurrent])
 
 	return (
-		<PierreFileTree
-			model={model}
-			className="files-tree"
-			renderContextMenu={(item: ContextMenuItem, context) => {
-				// The tree runs on slash-stripped paths and marks directories with a
-				// trailing slash (`folder/`); restore the leading slash and drop any
-				// trailing one so `volume.rm` resolves the entry itself — a trailing
-				// slash makes it clear the folder's contents but leave the folder behind.
-				const path = `/${item.path}`.replace(/\/+$/, '')
-				return (
-					<DeleteMenu
-						// Key on the target so re-aiming the menu at another row (right-click
-						// without dismissing first) remounts it, resetting the arm-to-confirm
-						// state instead of inheriting a primed click for the new target.
-						key={item.path}
-						label={`Delete ${item.kind === 'directory' ? 'folder' : 'file'}`}
-						onDelete={() => {
-							latest.current.onDelete(path)
-							context.close()
-						}}
-					/>
-				)
-			}}
-		/>
+		<>
+			{treeError ? <p className="files-error">{treeError}</p> : null}
+			{!ready ? (
+				<p className="files-hint">Loading…</p>
+			) : rootCount === 0 ? (
+				<p className="files-hint">
+					{props.showHidden ? 'No files yet' : 'No files yet — ⌘⇧. shows all'}
+				</p>
+			) : (
+				<PierreFileTree
+					model={model}
+					className="files-tree"
+					renderContextMenu={(item: ContextMenuItem, context) => {
+						const path = volumePath(item.path)
+						return (
+							<DeleteMenu
+								key={item.path}
+								label={`Delete ${item.kind === 'directory' ? 'folder' : 'file'}`}
+								onDelete={() => {
+									latest.current.onDelete(path)
+									context.close()
+								}}
+							/>
+						)
+					}}
+				/>
+			)}
+		</>
 	)
 }
