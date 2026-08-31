@@ -2,40 +2,22 @@ import { defineApp } from '@justfiles/app'
 import { volume } from '@justfiles/app/capabilities/volume'
 import * as v from 'valibot'
 
-// State is intentionally minimal — only durable facts worth carrying across a
-// reload: what the user is looking at, a cache-busting revision for the open
-// file, the last-known file list, and the last scan error. The bytes at a path
-// can change underneath us, so they belong to a query that re-reads on demand
-// (think `cat /path/to/file`), never to state.
-//
-// There is deliberately NO "a scan is running" flag here. Whether a scan is in
-// flight is runtime truth owned by the kernel's command runtime, not a durable
-// app fact — a persisted "loading" would be a lie after any restart (the command
-// is in memory only). The scan is emitted `.coalesce()`d, so the runtime
-// single-flights it and folds a trailing re-scan when a change lands mid-scan;
-// the reducer just asks for a scan and folds whatever files come back.
 export type FilesState = {
 	currentViewing: string | null
-	// Bumped each time the watched file changes on disk (Part D). The GUI keys its
-	// preview re-read on it, so an external edit refreshes the open file.
 	revision: number
-	files: Array<{ path: string }>
-	// Finder-style "show all files" toggle. Off by default: the GUI shows only the
-	// user-facing top-level folders (USER_FACING_ROOTS). On: the whole volume,
-	// including the runtime prefixes (⌘⇧. in the GUI, like macOS Finder). This is a
-	// persisted view MODE — the agent still sees the full `files` list either way;
-	// the whitelist is a presentation filter applied in the GUI, not in state.
+	treeRevision: number
 	showHidden: boolean
-	// Last scan failure, shown until the next scan clears it.
-	error: string | null
 }
+
+export type DirectoryResult =
+	| { path: string; entries: Array<{ ino: string; name: string; type: number }> }
+	| { path: string; error: string }
 
 export const initialState: FilesState = {
 	currentViewing: null,
 	revision: 0,
-	files: [],
-	showHidden: false,
-	error: null
+	treeRevision: 0,
+	showHidden: false
 }
 
 // The Finder-like whitelist: only these top-level folders are shown by default.
@@ -53,6 +35,16 @@ const USER_FACING_ROOTS = ['/notes', '/pictures', '/stickies'] as const
 export function isUserFacing(path: string): boolean {
 	const lower = path.toLowerCase()
 	return USER_FACING_ROOTS.some((root) => lower === root || lower.startsWith(`${root}/`))
+}
+
+// A write also drops the old persisted file-list cache.
+function normalizeState(state: FilesState): FilesState {
+	return {
+		currentViewing: state.currentViewing ?? null,
+		revision: state.revision ?? 0,
+		treeRevision: state.treeRevision ?? 0,
+		showHidden: state.showHidden ?? false
+	}
 }
 
 // Cap what the readFile query returns. 256 KiB is enough for inspecting
@@ -101,77 +93,63 @@ const pathSchema = v.pipe(
 export const app = defineApp({
 	init: initialState,
 	capabilities: { volume: volume({ scopes: ['system'] }) },
-	// Two watches, both pure functions of state (Part D). The recursive one is
-	// always live: it reports structural changes anywhere in the volume so the tree
-	// auto-refreshes (folds via `treeChanged`). The single-path one tracks the open
-	// file's bytes for the preview, kept alive only while `currentViewing` holds.
-	// The recursive watch is `.coalesce()`d: it is a wake ("the tree moved, re-scan"),
-	// so an unreduced event is fully superseded by a newer one — a bulk delete/import
-	// folds into one reduce plus a trailing one instead of queueing a dispatch per
-	// entry, which is what used to starve this app's queue (and its GUI boot).
 	subscriptions: (state, sub) => [
 		sub.capability('volume', 'watch', { path: '/', recursive: true }).coalesce().to('treeChanged'),
 		...(state.currentViewing
 			? [sub.capability('volume', 'watch', { path: state.currentViewing }).to('fileChanged')]
 			: [])
 	],
-	// Every state transition is a pure edge. The one effect — scanning the
-	// volume — is emitted as command data; its result folds back via `filesLoaded`.
-	// The scan is `.coalesce()`d, so the kernel single-flights it and folds a
-	// trailing re-scan when a change lands mid-scan (see kernel.command.ts).
-	update: (t) => {
-		const scan = () =>
-			t.cmd('volume', 'scan', { path: '/', recursive: true }).coalesce().to('filesLoaded')
-		return {
-			refresh: t.on(v.object({}), (state) => [{ ...state, error: null }, scan()], {
-				description: 'Refresh the visible file list.'
-			}),
-			// The recursive watch fired: a structural change reshaped the tree, so
-			// re-scan. Coalescing in the runtime collapses a burst (e.g. a git
-			// checkout) into one scan plus at most one trailing pass — no flag here.
-			treeChanged: t.fromEvent('volume', 'watch', (state) => [state, scan()]),
-			filesLoaded: t.fromResult('volume', 'scan', (state, r) => {
-				if (!r.ok) return { ...state, error: r.error.message }
-				const files = r.value
-					.filter((entry) => entry.type === 'file')
-					.map((entry) => ({ path: entry.path }))
-					.sort((a, b) => a.path.localeCompare(b.path))
-				const stillThere = files.some((file) => file.path === state.currentViewing)
-				return {
-					...state,
-					files,
-					currentViewing: stillThere ? state.currentViewing : null,
-					error: null
-				}
-			}),
-			setView: t.on(
-				v.object({ path: pathSchema }),
-				(state, { path }) => ({ ...state, currentViewing: path, error: null }),
-				{ description: 'Record which file the user is currently viewing.' }
-			),
-			clear: t.on(v.object({}), (state) => ({ ...state, currentViewing: null, error: null }), {
-				description: 'Clear the current Files selection.'
-			}),
-			// Flip the Finder-style "show all files" mode. Off (default) shows only the
-			// user-facing folders (USER_FACING_ROOTS); on shows the whole volume. The
-			// GUI binds this to ⌘⇧. (macOS's "show hidden files"). No re-scan: `files`
-			// already holds everything, so the GUI just re-derives what it renders.
-			toggleHidden: t.on(v.object({}), (state) => ({ ...state, showHidden: !state.showHidden }), {
+	update: (t) => ({
+		treeChanged: t.fromEvent('volume', 'watch', (state) => {
+			const next = normalizeState(state)
+			return { ...next, treeRevision: next.treeRevision + 1 }
+		}),
+		setView: t.on(
+			v.object({ path: pathSchema }),
+			(state, { path }) => ({ ...normalizeState(state), currentViewing: path }),
+			{ description: 'Record which file the user is currently viewing.' }
+		),
+		clear: t.on(v.object({}), (state) => ({ ...normalizeState(state), currentViewing: null }), {
+			description: 'Clear the current Files selection.'
+		}),
+		toggleHidden: t.on(
+			v.object({}),
+			(state) => {
+				const next = normalizeState(state)
+				return { ...next, showHidden: !next.showHidden }
+			},
+			{
 				description:
 					'Toggle showing every file vs only the user-facing folders (/notes, /pictures, /stickies).'
-			}),
-			// The watched file changed on disk — bump `revision` so the GUI re-reads it.
-			// The bytes themselves never enter state (the preview is a caller-scoped
-			// query); this is just the change signal.
-			fileChanged: t.fromEvent('volume', 'watch', (state) => ({
-				...state,
-				revision: state.revision + 1
-			}))
-		}
-	},
+			}
+		),
+		fileChanged: t.fromEvent('volume', 'watch', (state) => {
+			const next = normalizeState(state)
+			return { ...next, revision: next.revision + 1 }
+		})
+	}),
 	// A caller-scoped read (Part C): the bytes return to the caller, never into
 	// state. The kernel attaches the declared scopes to `app.invoke`.
 	procedures: (p) => ({
+		listDirectories: p.procedure({
+			description: 'List the direct children of one or more folders.',
+			audience: 'gui',
+			schema: v.object({ paths: v.pipe(v.array(pathSchema), v.minLength(1)) }),
+			async run({ paths }, app): Promise<DirectoryResult[]> {
+				return Promise.all(
+					[...new Set(paths)].map(async (path) => {
+						try {
+							return { path, entries: await app.invoke('volume', 'readdir', path) }
+						} catch (error) {
+							return {
+								path,
+								error: error instanceof Error ? error.message : String(error)
+							}
+						}
+					})
+				)
+			}
+		}),
 		readFile: p.procedure({
 			description:
 				'Read a file: images return a data URL, everything else text (capped at the preview limit).',
@@ -205,11 +183,6 @@ export const app = defineApp({
 			}
 		}),
 
-		// Destructive — gui-only (the right-click "Delete" in the tree). The agent
-		// never removes user files blindly. `recursive` clears a folder and all its
-		// contents; `force` makes a missing path a no-op. The removal fires the
-		// recursive watch, which folds a re-scan via `treeChanged` — so the tree
-		// refreshes itself and `filesLoaded` clears `currentViewing` if it's gone.
 		remove: p.procedure({
 			description: 'Delete a file or folder.',
 			audience: 'gui',
